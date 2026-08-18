@@ -94,7 +94,8 @@ echo 401 > "$MODE"; run "$CU" fetch --force >/dev/null 2>&1
 [[ -f $SB/.cache/claude-usage/auth-failed ]] && ok "auth-failed marker written" || no "auth-failed marker written"
 echo ok > "$MODE"
 b=$(count); run "$CU" fetch; check "no retry while credentials unchanged" "$(( $(count) - b ))" "0"
-touch "$SB/.claude/.credentials.json"
+# unambiguously newer than the auth-failed marker (mtimes are whole seconds)
+touch -d '+5 seconds' "$SB/.claude/.credentials.json" 2>/dev/null || touch -A 05 "$SB/.claude/.credentials.json"
 b=$(count); run "$CU" fetch --force >/dev/null 2>&1
 check "retries after credentials change" "$(( $(count) - b ))" "1"
 [[ -f $SB/.cache/claude-usage/auth-failed ]] && no "auth-failed cleared on success" || ok "auth-failed cleared on success"

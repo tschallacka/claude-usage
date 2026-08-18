@@ -73,7 +73,9 @@ cmd_fetch() {
   # Auth backoff: after a 401 do not retry until the credentials actually change.
   if [[ -f $AUTH_FAILED && -r $CREDS ]]; then
     local cm am; cm=$(_mtime "$CREDS"); am=$(_mtime "$AUTH_FAILED")
-    [[ -n $cm && -n $am ]] && (( cm <= am )) && exit 0
+    # Strictly-older only: if the two mtimes land in the same second we cannot
+    # tell which came first, so retry rather than risk staying stuck for good.
+    [[ -n $cm && -n $am ]] && (( cm < am )) && exit 0
   fi
 
   local token; token=$(_token)
