@@ -56,7 +56,13 @@ echo; echo "install"
 run bash "$PLUGIN/scripts/install.sh" --no-scheduler >/dev/null 2>&1
 [[ -x $CU ]] && ok "bin symlink created" || no "bin symlink created"
 grep -q 'claude-usage.bash' "$SB/.bashrc" && ok "bashrc block added" || no "bashrc block added"
-check "scoped model picked up from limits[]" "$(run "$CU" line --plain)" "5h 7% · 7d 24% · Opus 55%"
+check "scoped model picked up from limits[]" \
+  "$(run env CLAUDE_USAGE_STYLE=text CLAUDE_USAGE_COUNTDOWN=off "$CU" line --plain)" \
+  "5h 7% · 7d 24% · Opus 55%"
+lineout=$(run "$CU" line --plain)
+[[ $lineout == *"░"* && $lineout == *"7%"* ]] \
+  && ok "line renders bars by default" || no "line renders bars by default ($lineout)"
+[[ $lineout != 5h* ]] && ok "line session label is a countdown" || no "line session label is a countdown"
 
 echo; echo "one API call per interval, regardless of terminal count"
 rm -f "$SB/.cache/claude-usage/current.json" "$SB/.cache/claude-usage/current.txt"
@@ -82,12 +88,16 @@ check "stale heartbeat = no request" "$(( $(count) - b ))" "0"
 : > "$SB/.cache/claude-usage/heartbeat"
 
 echo; echo "failure handling keeps the last good numbers"
-before=$(run "$CU" line --plain)
+# COUNTDOWN=off: the reset label ticks in real time, so two renders taken either
+# side of a minute boundary would differ for reasons that have nothing to do
+# with the cache under test.
+snapshot() { run env CLAUDE_USAGE_COUNTDOWN=off "$CU" line --plain; }
+before=$(snapshot)
 echo 500 > "$MODE"; run "$CU" fetch --force >/dev/null 2>&1
-check "HTTP 500 keeps old cache" "$(run "$CU" line --plain)" "$before"
+check "HTTP 500 keeps old cache" "$(snapshot)" "$before"
 [[ -s $SB/.cache/claude-usage/last-error ]] && ok "500 recorded in last-error" || no "500 recorded in last-error"
 echo garbage > "$MODE"; run "$CU" fetch --force >/dev/null 2>&1
-check "non-JSON body keeps old cache" "$(run "$CU" line --plain)" "$before"
+check "non-JSON body keeps old cache" "$(snapshot)" "$before"
 
 echo; echo "401 backs off until credentials change"
 echo 401 > "$MODE"; run "$CU" fetch --force >/dev/null 2>&1
@@ -113,12 +123,49 @@ env HOME="$SB" CLAUDE_USAGE_DATA="$SB/.local/share/claude-usage" python3 "$PLUGI
   && ok "chart --text runs" || no "chart --text runs"
 
 echo; echo "prompt integration"
-out=$(env HOME="$SB" CLAUDE_USAGE_SELF_FETCH=0 bash --norc -i -c '
-  PS1="x"; . '"$PLUGIN"'/shell/claude-usage.bash
-  _claude_usage_precmd
-  printf "%s" "$CLAUDE_USAGE"' 2>/dev/null)
+render() {   # $* = extra env -> $out
+  out=$(env HOME="$SB" CLAUDE_USAGE_SELF_FETCH=0 "$@" bash --norc -i -c '
+    PS1="x"; . '"$PLUGIN"'/shell/claude-usage.bash
+    _claude_usage_precmd
+    printf "%s" "$CLAUDE_USAGE"' 2>/dev/null)
+}
+
+render CLAUDE_USAGE_STYLE=text CLAUDE_USAGE_COUNTDOWN=off
 [[ $out == $'\001'* ]] && ok "readline markers present (\\001..\\002)" || no "readline markers present"
 [[ $out == *"5h 7%"* ]] && ok "prompt shows cached numbers" || no "prompt shows cached numbers"
+
+render
+[[ $out == *"░"* ]] && ok "bar style is the default" || no "bar style is the default"
+[[ $out == *"7%"* && $out == *"24%"* ]] && ok "bar prompt keeps the numbers" || no "bar prompt keeps the numbers"
+[[ $out != *"5h"* ]] && ok "session label is a countdown, not 5h" || no "session label is a countdown"
+# every escape needs its own \001..\002 pair or long lines wrap wrong
+esc=${out//[!$'\033']/}; open=${out//[!$'\001']/}
+[[ ${#open} -eq ${#esc} ]] && ok "every escape is readline-wrapped" || no "every escape is readline-wrapped (${#open} vs ${#esc})"
+
+render CLAUDE_USAGE_COUNTDOWN=both
+[[ -n $out ]] && ok "countdown=both renders" || no "countdown=both renders"
+
+# countdown format: days+hours, hours, and minutes only inside the last hour
+dur() { bash --norc -i -c '. '"$PLUGIN"'/shell/claude-usage.bash 2>/dev/null
+  REPLY=; _claude_usage_dur '"$1 ${2:-coarse}"'; printf "%s" "$REPLY"' 2>/dev/null; }
+durcheck() { check "countdown ${4:-coarse} $2 -> $3" "$(dur "$1" "${4:-coarse}")" "$3"; }
+durcheck 571200 "6d14h" "6d 14h"
+durcheck 86400  "24h"   "1d 0h"
+durcheck 86399  "23h59" "23h"
+durcheck 3600   "1h"    "1h"
+durcheck 3540   "59m"   "59m"
+durcheck 30     "30s"   "<1m"
+durcheck -60    "past"  "<1m"
+# the 5h window keeps its minutes
+durcheck 15900  "4h25"  "4h25m" fine
+durcheck 3600   "1h00"  "1h"    fine
+durcheck 3540   "59m"   "59m"   fine
+
+render CLAUDE_USAGE_BAR_WIDTH=20 CLAUDE_USAGE_COUNTDOWN=off
+# 2 bars, or 3 when the payload carries a scoped model - each exactly 20 cells
+bars=${out//[!░█▌]/}
+(( ${#bars} >= 40 && ${#bars} % 20 == 0 )) \
+  && ok "bar width honoured (${#bars} cells)" || no "bar width honoured (${#bars} cells)"
 [[ $(env HOME="$SB" bash --norc -c '. '"$PLUGIN"'/shell/claude-usage.bash; echo LOADED=${CLAUDE_USAGE_LOADED:-no}') == "LOADED=no" ]] \
   && ok "non-interactive shells skipped" || no "non-interactive shells skipped"
 

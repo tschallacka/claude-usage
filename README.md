@@ -4,8 +4,16 @@ Claude Code usage limits in your bash prompt, your iTerm status bar, and Claude
 Code's own statusline — plus a CSV history you can chart later.
 
 ```
-5h 7% · 7d 24% · Opus 55%  mdibbets:~/www/proforto$
+4h25m [█░░░░░░░░░] 9% · 6d 14h [██▌░░░░░░░] 25%  mdibbets:~/www/proforto$
 ```
+
+Each bar is coloured by its own percentage, so a hot 7-day window is visible
+while the session is still green.  Both blocks are labelled with the time left
+until they reset rather than a flat `5h` / `7d`.  The 5h window is short enough
+to be worth the minutes (`4h25m`); the 7d one is deliberately coarse - `6d 14h`,
+then `14h`, dropping to minutes only inside the last hour - so a week-long label
+does not reflow every 60 seconds.  Set `CLAUDE_USAGE_STYLE=text` for
+the original one-line form, `5h 7% · 7d 24% · Opus 55%`.
 
 ## Why not just call the API from `PS1`
 
@@ -125,7 +133,11 @@ set -g status-right '#(~/.local/bin/claude-usage line --plain) | %H:%M'
 }
 ```
 
-Shows cwd, model, and the same cached usage numbers.
+Shows cwd, model, and the same cached usage numbers — bars, per-window colours
+and the reset countdown included, driven by the same `CLAUDE_USAGE_STYLE`,
+`CLAUDE_USAGE_COUNTDOWN` and `CLAUDE_USAGE_BAR_*` variables as the prompt.
+Export them from the statusline's own environment, not just `~/.bashrc`, since
+Claude Code does not run the command through an interactive shell.
 
 ## Tuning
 
@@ -139,8 +151,22 @@ Set these before the `~/.bashrc` block (or export them anywhere):
 | `CLAUDE_USAGE_IDLE_AFTER` | `300` | stop polling this long after the last prompt |
 | `CLAUDE_USAGE_STALE_AFTER` | `300` | after this, the segment greys out and gets a `*` |
 | `CLAUDE_USAGE_SELF_FETCH` | `1` | let shells refresh stale data themselves |
+| `CLAUDE_USAGE_STYLE` | `bar` | `bar` or `text` |
+| `CLAUDE_USAGE_COUNTDOWN` | `both` | label blocks with time-to-reset: `both`, `session`, `off` |
+| `CLAUDE_USAGE_BAR_WIDTH` | `10` | cells per bar |
+| `CLAUDE_USAGE_BAR_BRACKET` | `1` | `0` drops the `[ ]` around each bar |
+| `CLAUDE_USAGE_BAR_TROUGH` | `238` | 256-colour index of the unfilled part |
+| `CLAUDE_USAGE_BAR_FULL` / `_HALF` / `_EMPTY` | `█` `▌` `░` | bar characters |
 
 Colours: green < 50%, yellow < 75%, orange < 90%, red above, grey when stale.
+In `bar` mode each window is coloured independently; in `text` mode the whole
+segment takes the colour of the worst window.
+
+Bars round to the nearest half cell, and anything above 0% always shows at
+least a half cell, so "barely used" never renders as "untouched".  Rendering
+stays fork-free: the poller writes the reset times to `current.txt` as epoch
+seconds, so the countdown is integer arithmetic in bash rather than a `date`
+call on every prompt.
 
 ## Data for charts
 

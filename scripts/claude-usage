@@ -26,6 +26,14 @@ CREDS=$HOME/.claude/.credentials.json
 INTERVAL=${CLAUDE_USAGE_INTERVAL:-60}      # min seconds between API calls
 IDLE_AFTER=${CLAUDE_USAGE_IDLE_AFTER:-300} # stop polling this long after last prompt
 STALE_AFTER=${CLAUDE_USAGE_STALE_AFTER:-300}
+CU_STYLE=${CLAUDE_USAGE_STYLE:-bar}            # bar|text
+CU_COUNTDOWN=${CLAUDE_USAGE_COUNTDOWN:-both}    # both|session|off
+BAR_WIDTH=${CLAUDE_USAGE_BAR_WIDTH:-10}
+BAR_FULL=${CLAUDE_USAGE_BAR_FULL:-█}
+BAR_HALF=${CLAUDE_USAGE_BAR_HALF:-▌}
+BAR_EMPTY=${CLAUDE_USAGE_BAR_EMPTY:-░}
+BAR_TROUGH=${CLAUDE_USAGE_BAR_TROUGH:-238}
+BAR_BRACKET=${CLAUDE_USAGE_BAR_BRACKET:-1}
 API=${CLAUDE_USAGE_API:-https://api.anthropic.com/api/oauth/usage}
 UA=${CLAUDE_USAGE_UA:-claude-code/2.0.32}
 
@@ -113,9 +121,16 @@ cmd_fetch() {
 
   # current.txt: one tab-separated line, cheap enough for `read` in a prompt.
   # ts session weekly scoped scoped_model severity session_reset weekly_reset
+  #    session_reset_epoch weekly_reset_epoch
+  # The two epochs are here so the prompt can render a countdown with integer
+  # maths only - a shell cannot parse an ISO timestamp without forking `date`.
   jq -r --argjson now "$now" '
+    def epoch: if (. // "") == "" then 0
+      else (try (sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdateiso8601)
+            catch 0) end;
     [ $now, (.session // -1), (.weekly // -1), (.scoped // -1),
-      .scoped_model, .severity, .session_resets_at, .weekly_resets_at ] | @tsv' \
+      .scoped_model, .severity, .session_resets_at, .weekly_resets_at,
+      (.session_resets_at | epoch), (.weekly_resets_at | epoch) ] | @tsv' \
     <<<"$norm" > "$CURRENT_TXT.tmp" && mv -f "$CURRENT_TXT.tmp" "$CURRENT_TXT"
 
   # ---- history for charts: one CSV per month, so files stay small ----
@@ -140,13 +155,67 @@ cmd_fetch() {
 
 _read_current() {
   [[ -r $CURRENT_TXT ]] || return 1
-  IFS=$'\t' read -r U_TS U_SESSION U_WEEKLY U_SCOPED U_MODEL U_SEV U_SRESET U_WRESET < "$CURRENT_TXT" || return 1
+  IFS=$'\t' read -r U_TS U_SESSION U_WEEKLY U_SCOPED U_MODEL U_SEV U_SRESET U_WRESET \
+    U_SEPOCH U_WEPOCH < "$CURRENT_TXT" || return 1
   [[ -n ${U_TS:-} ]] || return 1
   : "${U_SESSION:=0}" "${U_WEEKLY:=0}" "${U_SCOPED:=-1}" "${U_MODEL:=scoped}" "${U_SEV:=normal}"
   [[ -z $U_SESSION || $U_SESSION == *[!0-9-]* ]] && U_SESSION=0
   [[ -z $U_WEEKLY  || $U_WEEKLY  == *[!0-9-]* ]] && U_WEEKLY=0
   [[ -z $U_SCOPED  || $U_SCOPED  == *[!0-9-]* ]] && U_SCOPED=-1
+  # absent in a current.txt written by an older version - fall back to 5h/7d
+  [[ -z ${U_SEPOCH:-} || ${U_SEPOCH:-} == *[!0-9]* ]] && U_SEPOCH=0
+  [[ -z ${U_WEPOCH:-} || ${U_WEPOCH:-} == *[!0-9]* ]] && U_WEPOCH=0
   U_AGE=$(( $(date +%s) - U_TS ))
+}
+
+# $2 = fine keeps the minutes (for the short 5h window); coarse drops them
+# above an hour, so a week-long label does not reflow every 60 seconds.
+_dur() {   # $1 = seconds, $2 = fine|coarse -> 6d 14h / 4h25m / 14h / 47m / <1m
+  local t=$1 fine=${2:-coarse} d h m
+  (( t < 0 )) && t=0
+  d=$(( t / 86400 )); h=$(( t % 86400 / 3600 )); m=$(( t % 3600 / 60 ))
+  if   (( d > 0 )); then printf '%dd %dh' "$d" "$h"
+  elif (( h > 0 )); then
+    printf '%dh' "$h"
+    [[ $fine == fine ]] && (( m > 0 )) && printf '%dm' "$m"
+  elif (( m > 0 )); then printf '%dm' "$m"
+  else                   printf '<1m'
+  fi
+  return 0
+}
+
+_bar() {   # $1 = percent -> $BAR_FILL and $BAR_REST
+  local pct=$1 w=$BAR_WIDTH halves full half i
+  (( pct < 0 ))   && pct=0
+  (( pct > 100 )) && pct=100
+  (( w < 1 ))     && w=1
+  halves=$(( (pct * w * 2 + 50) / 100 ))        # round to the nearest half cell
+  (( pct > 0 && halves == 0 )) && halves=1      # never render "in use" as empty
+  full=$(( halves / 2 )); half=$(( halves % 2 ))
+  BAR_FILL=''; BAR_REST=''
+  for (( i = 0; i < full; i++ )); do BAR_FILL+=$BAR_FULL; done
+  (( half )) && BAR_FILL+=$BAR_HALF
+  for (( i = full + half; i < w; i++ )); do BAR_REST+=$BAR_EMPTY; done
+  return 0
+}
+
+# $1 = label, $2 = percent, $3 = colour, $4 = plain|ansi|prompt -> one block.
+# In prompt mode every escape gets its own \001..\002 pair, or readline
+# miscounts the prompt width and long lines wrap wrong.
+_seg() {
+  local lbl=$1 pct=$2 col=$3 mode=$4 a='' b='' on='' off='' dim='' lb='' rb=''
+  _bar "$pct"
+  if [[ $mode != plain ]]; then
+    [[ $mode == prompt ]] && { a=$'\001'; b=$'\002'; }
+    printf -v on  '%s\033[38;5;%sm%s' "$a" "$col" "$b"
+    printf -v dim '%s\033[38;5;%sm%s' "$a" "$BAR_TROUGH" "$b"
+    printf -v off '%s\033[0m%s' "$a" "$b"
+  fi
+  (( BAR_BRACKET )) && { lb="$dim[$off"; rb="$dim]$off"; }
+  printf '%s %s%s%s%s%s%s%s%s %s%s%%%s' \
+    "$lbl" "$lb" "$on" "$BAR_FILL" "$off" "$dim" "$BAR_REST" "$off" "$rb" \
+    "$on" "$pct" "$off"
+  return 0
 }
 
 # 0-255 colour by worst percentage, grey when the data went stale.
@@ -163,8 +232,29 @@ cmd_line() {
   local mode=ansi
   case ${1:-} in --plain) mode=plain ;; --ansi) mode=ansi ;; --prompt) mode=prompt ;; esac
   _read_current || { [[ $mode == plain ]] && echo "claude ?"; return 0; }
+
+  # Labels: time left until each window resets, from the epochs in current.txt.
+  local now slbl=5h wlbl=7d
+  now=$(date +%s)
+  if [[ $CU_COUNTDOWN != off ]]; then
+    (( U_SEPOCH > 0 )) && slbl=$(_dur $(( U_SEPOCH - now )) fine)
+    [[ $CU_COUNTDOWN == both ]] && (( U_WEPOCH > 0 )) && wlbl=$(_dur $(( U_WEPOCH - now )))
+  fi
+
+  local txt
+  if [[ $CU_STYLE == bar ]]; then
+    # _colour already greys everything out once the data is stale
+    txt=$(_seg "$slbl" "$U_SESSION" "$(_colour "$U_SESSION" "$U_AGE")" "$mode")
+    txt+=" · $(_seg "$wlbl" "$U_WEEKLY" "$(_colour "$U_WEEKLY" "$U_AGE")" "$mode")"
+    (( U_SCOPED > 0 )) && \
+      txt+=" · $(_seg "$U_MODEL" "$U_SCOPED" "$(_colour "$U_SCOPED" "$U_AGE")" "$mode")"
+    (( U_AGE > STALE_AFTER )) && txt+=" (stale)"
+    printf '%s\n' "$txt"
+    return
+  fi
+
   local worst=$U_SESSION; (( U_WEEKLY > worst )) && worst=$U_WEEKLY
-  local txt="5h ${U_SESSION}% · 7d ${U_WEEKLY}%"
+  txt="$slbl ${U_SESSION}% · $wlbl ${U_WEEKLY}%"
   (( U_SCOPED > 0 )) && txt+=" · ${U_MODEL} ${U_SCOPED}%"
   (( U_AGE > STALE_AFTER )) && txt+=" (stale)"
   if [[ $mode == plain ]]; then printf '%s\n' "$txt"; return; fi
