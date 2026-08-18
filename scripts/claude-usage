@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+# claude-usage - one poller, many readers.
+# Subcommands: fetch | line | status | json | heartbeat | chart | install | uninstall | doctor
+set -uo pipefail
+
+# Resolve our own directory through symlinks (~/.local/bin/claude-usage is
+# a symlink into the plugin, and normalise.jq/chart.py live next to the real file).
+_self=${BASH_SOURCE[0]}
+while [[ -L $_self ]]; do
+  _link=$(readlink "$_self")
+  [[ $_link == /* ]] && _self=$_link || _self=$(cd -- "$(dirname -- "$_self")" && pwd)/$_link
+done
+SELF_DIR=$(cd -- "$(dirname -- "$_self")" && pwd)
+unset _self _link
+
+CACHE=${CLAUDE_USAGE_CACHE:-$HOME/.cache/claude-usage}
+DATA=${CLAUDE_USAGE_DATA:-$HOME/.local/share/claude-usage}
+HEARTBEAT=$CACHE/heartbeat
+LOCK=$CACHE/fetch.lock
+CURRENT_JSON=$CACHE/current.json
+CURRENT_TXT=$CACHE/current.txt
+AUTH_FAILED=$CACHE/auth-failed
+LAST_ERROR=$CACHE/last-error
+CREDS=$HOME/.claude/.credentials.json
+
+INTERVAL=${CLAUDE_USAGE_INTERVAL:-60}      # min seconds between API calls
+IDLE_AFTER=${CLAUDE_USAGE_IDLE_AFTER:-300} # stop polling this long after last prompt
+STALE_AFTER=${CLAUDE_USAGE_STALE_AFTER:-300}
+API=${CLAUDE_USAGE_API:-https://api.anthropic.com/api/oauth/usage}
+UA=${CLAUDE_USAGE_UA:-claude-code/2.0.32}
+
+die() { printf 'claude-usage: %s\n' "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# mtime, portable across GNU and BSD stat
+_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null; }
+_age() { local m; m=$(_mtime "$1") || return 1; [[ -n $m ]] || return 1; echo $(( $(date +%s) - m )); }
+
+_token() {
+  # macOS keychain first (that is where Claude Code stores it there), then the file.
+  if [[ $(uname -s) == Darwin ]] && have security; then
+    local raw
+    raw=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null) && \
+      jq -r '.claudeAiOauth.accessToken // empty' <<<"$raw" 2>/dev/null && return 0
+  fi
+  [[ -r $CREDS ]] && jq -r '.claudeAiOauth.accessToken // empty' "$CREDS" 2>/dev/null
+}
+
+# ---------------------------------------------------------------- fetch
+
+cmd_fetch() {
+  local force=0
+  [[ ${1:-} == --force || ${1:-} == -f ]] && force=1
+  mkdir -p "$CACHE" "$DATA"
+  have jq || die "jq is required (brew install jq / apt install jq)"
+
+  if (( ! force )); then
+    # Nobody is watching -> do not spend a request.
+    local hb; hb=$(_age "$HEARTBEAT" 2>/dev/null) || exit 0
+    (( hb > IDLE_AFTER )) && exit 0
+    # Fresh enough already (this is what makes N terminals cost 1 request).
+    local ca; ca=$(_age "$CURRENT_JSON" 2>/dev/null) && (( ca < INTERVAL )) && exit 0
+  fi
+
+  # Single-writer lock. mkdir is atomic on every filesystem we care about.
+  if ! mkdir "$LOCK" 2>/dev/null; then
+    local la; la=$(_age "$LOCK" 2>/dev/null)
+    if [[ -n ${la:-} ]] && (( la > 120 )); then rmdir "$LOCK" 2>/dev/null; mkdir "$LOCK" 2>/dev/null || exit 0
+    else exit 0; fi
+  fi
+  trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+
+  # Auth backoff: after a 401 do not retry until the credentials actually change.
+  if [[ -f $AUTH_FAILED && -r $CREDS ]]; then
+    local cm am; cm=$(_mtime "$CREDS"); am=$(_mtime "$AUTH_FAILED")
+    [[ -n $cm && -n $am ]] && (( cm <= am )) && exit 0
+  fi
+
+  local token; token=$(_token)
+  [[ -n ${token:-} ]] || { echo "no oauth token found" > "$LAST_ERROR"; exit 1; }
+
+  local body http
+  body=$(curl -sS --max-time 10 -w '\n%{http_code}' "$API" \
+    -H 'Accept: application/json' -H 'Content-Type: application/json' \
+    -H "User-Agent: $UA" -H 'anthropic-beta: oauth-2025-04-20' \
+    -H "Authorization: Bearer $token" 2>>"$LAST_ERROR")
+  local rc=$?
+  http=${body##*$'\n'}; body=${body%$'\n'*}
+  if (( rc != 0 )); then echo "curl exit $rc at $(date -u +%FT%TZ)" > "$LAST_ERROR"; exit 1; fi
+
+  case $http in
+    200) : ;;
+    401|403) printf 'HTTP %s (token rejected) at %s\n' "$http" "$(date -u +%FT%TZ)" > "$LAST_ERROR"
+             : > "$AUTH_FAILED"; exit 1 ;;
+    429)  printf 'HTTP 429 rate limited at %s\n' "$(date -u +%FT%TZ)" > "$LAST_ERROR"; exit 1 ;;
+    *)    printf 'HTTP %s at %s\n' "$http" "$(date -u +%FT%TZ)" > "$LAST_ERROR"; exit 1 ;;
+  esac
+  jq -e . >/dev/null 2>&1 <<<"$body" || { echo "non-json body at $(date -u +%FT%TZ)" > "$LAST_ERROR"; exit 1; }
+
+  rm -f "$AUTH_FAILED" "$LAST_ERROR"
+  local now iso; now=$(date +%s); iso=$(date -u +%FT%TZ)
+
+  # Normalise once, here, so every reader is trivial.
+  # limits[] is the current shape; the flat five_hour/seven_day keys are the
+  # older one and are kept as a fallback.
+  local norm
+  norm=$(jq -c -f "$SELF_DIR/normalise.jq" <<<"$body") \
+    || { echo "jq normalise failed" > "$LAST_ERROR"; exit 1; }
+
+  printf '%s\n' "$body" > "$CURRENT_JSON.tmp" && mv -f "$CURRENT_JSON.tmp" "$CURRENT_JSON"
+
+  # current.txt: one tab-separated line, cheap enough for `read` in a prompt.
+  # ts session weekly scoped scoped_model severity session_reset weekly_reset
+  jq -r --argjson now "$now" '
+    [ $now, (.session // -1), (.weekly // -1), (.scoped // -1),
+      .scoped_model, .severity, .session_resets_at, .weekly_resets_at ] | @tsv' \
+    <<<"$norm" > "$CURRENT_TXT.tmp" && mv -f "$CURRENT_TXT.tmp" "$CURRENT_TXT"
+
+  # ---- history for charts: one CSV per month, so files stay small ----
+  local hist=$DATA/history-$(date -u +%Y-%m).csv
+  [[ -f $hist ]] || echo 'ts,iso,session,weekly,weekly_scoped,scoped_model,severity,session_resets_at,weekly_resets_at,extra_utilization,spend_percent' > "$hist"
+  jq -r --argjson now "$now" --arg iso "$iso" '
+    [ $now, $iso, .session, .weekly, .scoped, .scoped_model, .severity,
+      .session_resets_at, .weekly_resets_at, .extra, .spend ] | @csv' <<<"$norm" >> "$hist"
+
+  # Full raw payload, but only when something actually changed: keeps every
+  # field the API may add later without writing 1440 duplicates a day.
+  local raw=$DATA/raw-$(date -u +%Y-%m).jsonl sig prev
+  sig=$(jq -c '{session,weekly,scoped,extra,spend}' <<<"$norm")
+  prev=$(cat "$CACHE/last-signature" 2>/dev/null || true)
+  if [[ $sig != "$prev" ]]; then
+    jq -c --argjson ts "$now" --arg iso "$iso" '{ts:$ts,iso:$iso,usage:.}' <<<"$body" >> "$raw"
+    printf '%s' "$sig" > "$CACHE/last-signature"
+  fi
+}
+
+# ---------------------------------------------------------------- readers
+
+_read_current() {
+  [[ -r $CURRENT_TXT ]] || return 1
+  IFS=$'\t' read -r U_TS U_SESSION U_WEEKLY U_SCOPED U_MODEL U_SEV U_SRESET U_WRESET < "$CURRENT_TXT" || return 1
+  [[ -n ${U_TS:-} ]] || return 1
+  : "${U_SESSION:=0}" "${U_WEEKLY:=0}" "${U_SCOPED:=-1}" "${U_MODEL:=scoped}" "${U_SEV:=normal}"
+  [[ -z $U_SESSION || $U_SESSION == *[!0-9-]* ]] && U_SESSION=0
+  [[ -z $U_WEEKLY  || $U_WEEKLY  == *[!0-9-]* ]] && U_WEEKLY=0
+  [[ -z $U_SCOPED  || $U_SCOPED  == *[!0-9-]* ]] && U_SCOPED=-1
+  U_AGE=$(( $(date +%s) - U_TS ))
+}
+
+# 0-255 colour by worst percentage, grey when the data went stale.
+_colour() {
+  local worst=$1 age=$2
+  (( age > STALE_AFTER )) && { echo 244; return; }
+  if   (( worst >= 90 )); then echo 197
+  elif (( worst >= 75 )); then echo 208
+  elif (( worst >= 50 )); then echo 178
+  else echo 71; fi
+}
+
+cmd_line() {
+  local mode=ansi
+  case ${1:-} in --plain) mode=plain ;; --ansi) mode=ansi ;; --prompt) mode=prompt ;; esac
+  _read_current || { [[ $mode == plain ]] && echo "claude ?"; return 0; }
+  local worst=$U_SESSION; (( U_WEEKLY > worst )) && worst=$U_WEEKLY
+  local txt="5h ${U_SESSION}% · 7d ${U_WEEKLY}%"
+  (( U_SCOPED > 0 )) && txt+=" · ${U_MODEL} ${U_SCOPED}%"
+  (( U_AGE > STALE_AFTER )) && txt+=" (stale)"
+  if [[ $mode == plain ]]; then printf '%s\n' "$txt"; return; fi
+  local c; c=$(_colour "$worst" "$U_AGE")
+  if [[ $mode == prompt ]]; then
+    printf '\001\033[38;5;%sm\002%s\001\033[0m\002\n' "$c" "$txt"
+  else
+    printf '\033[38;5;%sm%s\033[0m\n' "$c" "$txt"
+  fi
+}
+
+cmd_status() {
+  _read_current || { echo "no data yet - run: claude-usage fetch --force"; return 1; }
+  printf '5-hour session   %3s%%   resets %s\n' "$U_SESSION" "${U_SRESET:-?}"
+  printf '7-day  all       %3s%%   resets %s\n' "$U_WEEKLY"  "${U_WRESET:-?}"
+  (( U_SCOPED >= 0 )) && printf '7-day  %-10s %3s%%\n' "$U_MODEL" "$U_SCOPED"
+  printf 'severity         %s\n' "$U_SEV"
+  printf 'data age         %ss\n' "$U_AGE"
+  [[ -f $AUTH_FAILED ]] && printf 'auth             EXPIRED - run any claude command to refresh the token\n'
+  [[ -f $LAST_ERROR  ]] && printf 'last error       %s' "$(cat "$LAST_ERROR")"
+  local n; n=$(cat "$DATA"/history-*.csv 2>/dev/null | grep -cv '^ts,' || true)
+  printf 'history rows     %s in %s\n' "${n:-0}" "$DATA"
+}
+
+cmd_json() { cat "$CURRENT_JSON" 2>/dev/null; }
+
+cmd_heartbeat() { mkdir -p "$CACHE"; : > "$HEARTBEAT"; }
+
+cmd_chart() {
+  have python3 || die "python3 is required for charts"
+  python3 "$SELF_DIR/chart.py" "$@"
+}
+
+cmd_doctor() {
+  printf 'os            %s\n' "$(uname -s)"
+  printf 'jq            %s\n' "$(command -v jq || echo MISSING)"
+  printf 'curl          %s\n' "$(command -v curl || echo MISSING)"
+  printf 'token         %s\n' "$([[ -n $(_token) ]] && echo found || echo MISSING)"
+  printf 'cache         %s\n' "$CACHE"
+  printf 'heartbeat     %s\n' "$([[ -f $HEARTBEAT ]] && echo "$(_age "$HEARTBEAT")s ago" || echo missing)"
+  printf 'current.json  %s\n' "$([[ -f $CURRENT_JSON ]] && echo "$(_age "$CURRENT_JSON")s old" || echo missing)"
+  if [[ $(uname -s) == Darwin ]]; then
+    printf 'launchd       %s\n' "$(launchctl list 2>/dev/null | grep -c dev.local.claude-usage) matching job(s)"
+  else
+    printf 'systemd timer %s\n' "$(systemctl --user is-active claude-usage.timer 2>/dev/null || echo inactive)"
+  fi
+  printf 'bashrc hook   %s\n' "$(grep -c 'claude-usage.bash' "$HOME/.bashrc" 2>/dev/null || echo 0)"
+}
+
+case ${1:-status} in
+  fetch)     shift; cmd_fetch "$@" ;;
+  line)      shift; cmd_line "$@" ;;
+  status)    shift; cmd_status "$@" ;;
+  json)      shift; cmd_json "$@" ;;
+  heartbeat) shift; cmd_heartbeat "$@" ;;
+  chart)     shift; cmd_chart "$@" ;;
+  doctor)    shift; cmd_doctor "$@" ;;
+  install)   shift; exec "$SELF_DIR/install.sh" "$@" ;;
+  uninstall) shift; exec "$SELF_DIR/install.sh" --uninstall "$@" ;;
+  -h|--help|help) sed -n '2,4p' "${BASH_SOURCE[0]}" ;;
+  *) die "unknown subcommand: $1" ;;
+esac

@@ -1,0 +1,10 @@
+{
+  "name": "claude-usage",
+  "description": "Always-visible Claude Code usage limits in your shell prompt, iTerm status bar and Claude Code statusline. One background fetcher, many zero-cost readers, plus CSV history for charting.",
+  "version": "1.0.0",
+  "author": { "name": "Michael Dibbets", "email": "michael@bigbridge.nl" },
+  "license": "MIT",
+  "keywords": ["usage", "limits", "statusline", "prompt", "bash", "iterm", "quota"],
+  "commands": "./commands/",
+  "hooks": "./hooks/hooks.json"
+}

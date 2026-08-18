@@ -1,0 +1,7 @@
+{
+  "name": "local-usage",
+  "owner": { "name": "Michael Dibbets", "email": "michael@bigbridge.nl" },
+  "plugins": [
+    { "source": "./", "name": "claude-usage" }
+  ]
+}
