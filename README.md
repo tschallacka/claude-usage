@@ -211,6 +211,12 @@ writes an `auth-failed` marker and stops retrying until `~/.claude/.credentials.
 changes — Claude Code rewrites it when it refreshes the token, and the poller
 picks up automatically.
 
+Scheduler installation is skipped when `$HOME` does not match the invoking
+user's real home.  `launchctl`, `systemctl --user` and `crontab` are scoped to
+the login session rather than to `$HOME`, so a redirected-`$HOME` run - a test
+suite, a container - would otherwise reach out of its sandbox and stop the real
+user's poller.
+
 ## Tests
 
 ```bash

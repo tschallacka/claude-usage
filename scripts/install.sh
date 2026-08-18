@@ -20,6 +20,28 @@ say()  { printf '  %s\n' "$*"; }
 head_() { printf '\n%s\n' "$*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# Every other path here is $HOME-scoped, but launchctl, `systemctl --user` and
+# crontab are scoped to the login session instead - they ignore $HOME entirely.
+# So when $HOME has been redirected (the test suite, a container, a bare
+# `HOME=/tmp/x ./install.sh`), touching a scheduler would reach straight out of
+# the sandbox and stop the real user's poller.  Detect that and skip it.
+real_home() {
+  local u h=''
+  u=$(id -un 2>/dev/null) || return 1
+  h=$(getent passwd "$u" 2>/dev/null | cut -d: -f6) || true
+  [[ -n $h ]] || h=$(eval "printf '%s' ~$u" 2>/dev/null) || true
+  [[ $h == /* ]] || h=''          # ~u stays literal when the user is unknown
+  printf '%s' "$h"
+}
+home_redirected() {
+  local rh; rh=$(real_home)
+  [[ -n $rh && $rh != "$HOME" ]]
+}
+say_sandboxed() {
+  say "\$HOME is redirected to $HOME - leaving this login session's scheduler alone"
+  say "(launchctl, systemctl --user and crontab are per session, not per \$HOME)"
+}
+
 uninstall=0; no_scheduler=0; no_bashrc=0
 for a in "$@"; do case $a in
   --uninstall) uninstall=1 ;;
@@ -40,7 +62,9 @@ remove_bashrc_block() {
 
 if (( uninstall )); then
   head_ "Uninstalling claude-usage"
-  if [[ $(uname -s) == Darwin ]]; then
+  if home_redirected; then
+    say_sandboxed
+  elif [[ $(uname -s) == Darwin ]]; then
     launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || launchctl unload "$PLIST" 2>/dev/null || true
     rm -f "$PLIST" && say "removed launchd agent"
   else
@@ -78,7 +102,10 @@ else
 fi
 
 # 2. background poller
-if (( ! no_scheduler )); then
+if (( ! no_scheduler )) && home_redirected; then
+  head_ "Background poller"
+  say_sandboxed
+elif (( ! no_scheduler )); then
   if [[ $(uname -s) == Darwin ]]; then
     mkdir -p "$(dirname "$PLIST")"
     cat > "$PLIST" <<PLISTEOF

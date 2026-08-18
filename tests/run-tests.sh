@@ -56,6 +56,12 @@ echo; echo "install"
 run bash "$PLUGIN/scripts/install.sh" --no-scheduler >/dev/null 2>&1
 [[ -x $CU ]] && ok "bin symlink created" || no "bin symlink created"
 grep -q 'claude-usage.bash' "$SB/.bashrc" && ok "bashrc block added" || no "bashrc block added"
+# The scheduler is per login session, not per $HOME, so a sandboxed run must
+# refuse to touch it - this suite used to disable the real user's timer.
+sched_out=$(run bash "$PLUGIN/scripts/install.sh" 2>&1)
+[[ $sched_out == *"redirected"* ]] \
+  && ok "sandboxed install leaves the session scheduler alone" \
+  || no "sandboxed install leaves the session scheduler alone"
 check "scoped model picked up from limits[]" \
   "$(run env CLAUDE_USAGE_STYLE=text CLAUDE_USAGE_COUNTDOWN=off "$CU" line --plain)" \
   "5h 7% · 7d 24% · Opus 55%"
@@ -171,7 +177,10 @@ bars=${out//[!░█▌]/}
 
 echo; echo "uninstall"
 cp "$SB/.bashrc" "$TMP/bashrc.before"
-run bash "$PLUGIN/scripts/install.sh" --uninstall >/dev/null 2>&1
+unin_out=$(run bash "$PLUGIN/scripts/install.sh" --uninstall 2>&1)
+[[ $unin_out == *"redirected"* ]] \
+  && ok "sandboxed uninstall leaves the session scheduler alone" \
+  || no "sandboxed uninstall leaves the session scheduler alone"
 grep -q 'claude-usage' "$SB/.bashrc" && no "bashrc block removed" || ok "bashrc block removed"
 [[ -e $CU ]] && no "bin symlink removed" || ok "bin symlink removed"
 [[ -d $SB/.local/share/claude-usage ]] && ok "history preserved on uninstall" || no "history preserved on uninstall"
