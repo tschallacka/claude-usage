@@ -63,7 +63,7 @@ if [[ -z ${NO_PLUGIN:-} ]] && have claude; then
   fi
 fi
 
-head_ "Done"
+head_ "Next steps"
 say "Open a new terminal, or:  . ~/.bashrc"
 say "Optional Claude Code statusline - add to ~/.claude/settings.json:"
 say '  "statusLine": { "type": "command", "command": "'"$DEST"'/scripts/statusline.sh" }'
