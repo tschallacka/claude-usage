@@ -3,8 +3,8 @@
   "description": "Always-visible Claude Code usage limits in your shell prompt, iTerm status bar and Claude Code statusline. One background fetcher, many zero-cost readers, plus CSV history for charting.",
   "version": "1.0.0",
   "author": {
-    "name": "Michael Dibbets",
-    "email": "michael@bigbridge.nl"
+    "name": "Tschallacka",
+    "email": "8638425+tschallacka@users.noreply.github.com"
   },
   "license": "MIT",
   "keywords": [
@@ -15,5 +15,7 @@
     "bash",
     "iterm",
     "quota"
-  ]
+  ],
+  "homepage": "https://github.com/tschallacka/claude-usage",
+  "repository": "https://github.com/tschallacka/claude-usage"
 }

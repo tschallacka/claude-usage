@@ -1,7 +1,13 @@
 {
-  "name": "local-usage",
-  "owner": { "name": "Michael Dibbets", "email": "michael@bigbridge.nl" },
+  "name": "claude-usage",
+  "owner": {
+    "name": "Tschallacka",
+    "email": "8638425+tschallacka@users.noreply.github.com"
+  },
   "plugins": [
-    { "source": "./", "name": "claude-usage" }
+    {
+      "source": "./",
+      "name": "claude-usage"
+    }
   ]
 }

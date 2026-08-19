@@ -4,7 +4,7 @@ Claude Code usage limits in your bash prompt, your iTerm status bar, and Claude
 Code's own statusline — plus a CSV history you can chart later.
 
 ```
-4h25m [█░░░░░░░░░] 9% · 6d 14h [██▌░░░░░░░] 25%  mdibbets:~/www/proforto$
+4h25m [█░░░░░░░░░] 9% · 6d 14h [██▌░░░░░░░] 25%  you:~/code/thing$
 ```
 
 Each bar is coloured by its own percentage, so a hot 7-day window is visible
@@ -45,23 +45,30 @@ systemd timer just keeps the numbers current while you sit idle.
 ## Install
 
 ```bash
-claude plugin marketplace add ~/claude-usage-plugin
-claude plugin install claude-usage@local-usage
+curl -fsSL https://raw.githubusercontent.com/tschallacka/claude-usage/main/install.sh | bash
 ```
 
-Then, inside Claude Code:
+That clones the repo to `~/.local/share/claude-usage-plugin`, installs the
+prompt segment and poller, and registers the Claude Code plugin so you get
+`/claude-usage:status`, `:chart` and `:doctor`.  Re-run it to update.
 
-```
-/claude-usage:install
-```
+Piping a script into your shell is a lot of trust to extend to a stranger, so
+read it first if you would rather not: it is
+[install.sh](install.sh), about 60 lines, and everything it touches lives under
+`$HOME`.  Flags: `--no-scheduler`, `--no-bashrc`, `--no-plugin`.
 
-or straight from a shell:
+<details>
+<summary>Or install by hand</summary>
 
 ```bash
-~/claude-usage-plugin/scripts/install.sh
+git clone https://github.com/tschallacka/claude-usage.git
+./claude-usage/scripts/install.sh
+claude plugin marketplace add tschallacka/claude-usage
+claude plugin install claude-usage@claude-usage
 ```
+</details>
 
-It requires `jq` and `curl`, and it:
+The installer requires `git`, `jq` and `curl`, and it:
 
 - symlinks `~/.local/bin/claude-usage`
 - fetches once so the prompt has something to show
@@ -102,7 +109,7 @@ component on its own cadence:
 
 ```bash
 mkdir -p ~/Library/Application\ Support/iTerm2/Scripts/AutoLaunch
-cp ~/claude-usage-plugin/extras/iterm2-statusbar.py \
+cp ~/.local/share/claude-usage-plugin/extras/iterm2-statusbar.py \
    ~/Library/Application\ Support/iTerm2/Scripts/AutoLaunch/
 ```
 
@@ -128,7 +135,7 @@ set -g status-right '#(~/.local/bin/claude-usage line --plain) | %H:%M'
 {
   "statusLine": {
     "type": "command",
-    "command": "~/claude-usage-plugin/scripts/statusline.sh"
+    "command": "~/.local/share/claude-usage-plugin/scripts/statusline.sh"
   }
 }
 ```
@@ -231,7 +238,7 @@ real config.
 ## Uninstall
 
 ```bash
-~/claude-usage-plugin/scripts/install.sh --uninstall
+~/.local/share/claude-usage-plugin/scripts/install.sh --uninstall
 ```
 
 Removes the scheduler, the `~/.bashrc` block (keeping a timestamped backup) and
